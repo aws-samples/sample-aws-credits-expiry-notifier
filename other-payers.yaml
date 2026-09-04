@@ -1,0 +1,128 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  AWS Credits Notifier - Solution 2, SPOKE role. Deploy this in EVERY payer
+  account you want the hub to monitor. It creates a single read-only IAM role
+  that the hub account's notifier Lambda assumes to call billing:GetCredits.
+  IAM is global, so deploy in one region only (us-east-1 recommended).
+  Pure CloudFormation - no transforms or macros. StackSets-compatible.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Trust configuration}
+        Parameters: [HubAccountId, HubRoleNamePattern, RoleName, ExternalId]
+      - Label: {default: Optional hardening}
+        Parameters: [PermissionsBoundaryArn]
+
+Parameters:
+
+  HubAccountId:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+    Description: >
+      12-digit account ID of the hub account running the notifier Lambda. This
+      is the HubAccountId output of the hub stack.
+
+  RoleName:
+    Type: String
+    Default: AWSCreditsNotifierReadRole
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    Description: >
+      Name of the role to create. MUST exactly match the AssumeRoleName
+      parameter of the hub stack, and must be identical across all payer
+      accounts - the hub assumes one role name everywhere.
+
+  HubRoleNamePattern:
+    Type: String
+    AllowedPattern: '^[\w+=,.@-][\w+=,.@*-]{0,63}$'
+    Description: >
+      REQUIRED. The hub notifier Lambda execution role name, so this role trusts
+      only that specific role rather than any principal in the hub account. The
+      hub stack outputs it as NotifierRoleName; it is
+      <hub-stack-name>-notifier-role. A trailing wildcard is allowed (for example
+      credit-notifier-stack-*) so a hub role rename does not break the trust. Do
+      not set this to "*" on its own - the AllowedPattern requires at least one
+      leading literal character to prevent that.
+
+  ExternalId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      OPTIONAL shared secret, layered on top of the required HubRoleNamePattern
+      restriction. When set, the AssumeRole call must also present this exact
+      string. Defends against the confused-deputy problem, which applies when a
+      third party assumes roles on behalf of several customers - not the case
+      when you own the hub. Leave blank unless a third party operates your hub.
+      If set, the hub stack MUST use the identical value or every call fails.
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: Optional permissions boundary to attach, if your org requires one.
+
+Conditions:
+  HasExternalId: !Not [!Equals [!Ref ExternalId, '']]
+  HasBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+
+  CreditsReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      Description: Lets the credits-notifier hub account read this account's AWS credits
+      MaxSessionDuration: 3600
+      PermissionsBoundary: !If [HasBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: TrustHubAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${HubAccountId}:root'
+            Action: 'sts:AssumeRole'
+            # ArnLike is always rendered, so the trust is never a bare account
+            # root - only the named hub role can assume this. ExternalId, when
+            # set, is layered on as an additional StringEquals requirement.
+            Condition: !If
+              - HasExternalId
+              - ArnLike:
+                  'aws:PrincipalArn': !Sub 'arn:${AWS::Partition}:iam::${HubAccountId}:role/${HubRoleNamePattern}'
+                StringEquals:
+                  'sts:ExternalId': !Ref ExternalId
+              - ArnLike:
+                  'aws:PrincipalArn': !Sub 'arn:${AWS::Partition}:iam::${HubAccountId}:role/${HubRoleNamePattern}'
+      Policies:
+        - PolicyName: read-credits
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # billing:GetCredits does not support resource-level permissions,
+              # so Resource must be "*". It is a read-only billing action and
+              # grants no access to spend data, invoices or any other service.
+              - Sid: ReadCredits
+                Effect: Allow
+                Action: 'billing:GetCredits'
+                Resource: '*'
+      Tags:
+        - {Key: Application, Value: aws-credits-notifier}
+        - {Key: ManagedBy, Value: !Ref 'AWS::StackName'}
+
+Outputs:
+
+  RoleArn:
+    Description: ARN of the role the hub will assume.
+    Value: !GetAtt CreditsReadRole.Arn
+
+  RoleNameOut:
+    Description: >
+      Confirm this matches the hub stack's AssumeRoleName parameter exactly.
+    Value: !Ref CreditsReadRole
+
+  VerifyCommand:
+    Description: >
+      Run from the hub account to confirm the trust works before waiting on the
+      schedule.
+    Value: !Sub 'aws sts assume-role --role-arn ${CreditsReadRole.Arn} --role-session-name verify'

@@ -1,0 +1,1064 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  AWS Credits Notifier - Solution 3 (single self-contained file). Notifies when a
+  new AWS credit is assigned and when a credit approaches expiry. Upload this ONE
+  template in the CloudFormation console and deploy - no S3 bucket, no zip to
+  stage, no Lambda layer, no CLI. The handler source travels inside the template
+  and is installed by a custom resource. Pure CloudFormation - no transforms.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: 1. Notification delivery}
+        Parameters: [NotificationEmails, ExistingSnsTopicArn, SnsKmsKeyArn]
+      - Label: {default: 2. Accounts to monitor}
+        Parameters: [TargetPayerAccounts, AssumeRoleName, ExternalId]
+      - Label: {default: 3. Alerting behaviour}
+        Parameters:
+          - ExpiryThresholdDays
+          - MinRemainingForExpiryAlert
+          - ScheduleExpression
+          - ScheduleState
+      - Label: {default: 4. Runtime and retention}
+        Parameters: [LambdaRuntime, FunctionTimeout, StateRetentionDays, LogRetentionDays]
+    ParameterLabels:
+      NotificationEmails: {default: Notification email addresses (comma separated)}
+      TargetPayerAccounts: {default: Extra payer accounts to monitor (optional)}
+      ExistingSnsTopicArn: {default: Reuse an existing SNS topic (optional)}
+      SnsKmsKeyArn: {default: Customer managed KMS key for SNS (optional)}
+
+Parameters:
+
+  # ---- 1. notification delivery
+
+  NotificationEmails:
+    Type: String
+    Default: ''
+    # {0,9} caps the list at 10 so an 11th address fails validation loudly
+    # rather than being silently dropped by the fixed-index subscriptions.
+    AllowedPattern: '^$|^[^@\s,]+@[^@\s,]+\.[^@\s,]+(,[^@\s,]+@[^@\s,]+\.[^@\s,]+){0,9}$'
+    ConstraintDescription: >
+      Up to 10 comma-separated email addresses with NO SPACES, e.g.
+      finops@example.com,cloudops@example.com
+    Description: >
+      Email addresses to notify, comma separated, NO SPACES. Up to 10 supported.
+      Each address receives an SNS confirmation email that MUST be clicked before
+      alerts are delivered. Leave blank only if reusing an existing topic that
+      already has subscribers.
+
+  ExistingSnsTopicArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:sns:[a-z0-9-]+:[0-9]{12}:.+$'
+    Description: >
+      OPTIONAL. ARN of an existing SNS topic to publish into, for example one
+      already wired to a ticketing system or chat channel. Leave blank to create
+      a new topic. Must be in this account and region.
+
+  SnsKmsKeyArn:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/.+$'
+    Description: >
+      OPTIONAL. Customer managed KMS key ARN for encrypting the new SNS topic.
+      Leave blank to use the AWS managed key alias/aws/sns.
+
+  # ---- 2. accounts to monitor
+
+  TargetPayerAccounts:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[0-9]{12}(,[0-9]{12})*$'
+    ConstraintDescription: >
+      Comma-separated 12-digit account IDs with no spaces, e.g.
+      222233334444,333344445555
+    Description: >
+      OPTIONAL. Leave BLANK to monitor only this account, which needs no extra
+      setup. If you set it, it REPLACES the list rather than adding to it - so
+      list EVERY payer account you want monitored, INCLUDING this one, or this
+      account stops being monitored. Each OTHER account also needs
+      other-payers.yaml deployed in it first.
+      Example: 111122223333,222233334444,333344445555
+
+  AssumeRoleName:
+    Type: String
+    Default: AWSCreditsNotifierReadRole
+    AllowedPattern: '^[\w+=,.@-]{1,64}$'
+    Description: >
+      Only used when TargetPayerAccounts is set. Name of the read-only role to
+      assume in each OTHER payer account. This account is always read directly.
+
+  ExternalId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: >
+      OPTIONAL shared secret, only used when TargetPayerAccounts is set. When
+      set, each spoke role accepts the AssumeRole call ONLY if it also presents
+      this exact string. It guards against a third party tricking a shared hub
+      into reading an account it should not - not a risk when you own every
+      account. RECOMMENDED: leave blank. If set, the identical value must be set
+      in EVERY spoke stack, and NoEcho means you cannot read it back later.
+
+  # ---- 3. alerting behaviour
+
+  ExpiryThresholdDays:
+    Type: String
+    Default: '90,60,30,7'
+    AllowedPattern: '^[0-9]+(,[0-9]+)*$'
+    ConstraintDescription: Comma-separated whole numbers with no spaces, e.g. 90,60,30,7
+    Description: >
+      Days-before-expiry at which to alert, comma separated. Each threshold
+      fires at most once per credit.
+
+  MinRemainingForExpiryAlert:
+    Type: String
+    Default: '0'
+    AllowedPattern: '^[0-9]+(\.[0-9]{1,2})?$'
+    Description: >
+      Suppress expiry alerts when the remaining balance is below this amount.
+      Leave at 0 to be told about every expiring credit. New-credit alerts are
+      never suppressed by this.
+
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 13 * * ? *)'
+    Description: >
+      When to check for changes. Default 13:00 UTC daily. Estimated credit
+      balances refresh every 24 hours, so daily is the useful maximum.
+
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: >
+      Set to DISABLED to deploy without starting the daily checks, then enable
+      once you have confirmed a manual invoke works.
+
+  # ---- 4. runtime and retention
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.13
+    AllowedValues: [python3.12, python3.13]
+    Description: Python runtime for both functions.
+
+  FunctionTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: >
+      Seconds. Accounts are walked sequentially, so raise this if you list many
+      in TargetPayerAccounts.
+
+  StateRetentionDays:
+    Type: Number
+    Default: 400
+    MinValue: 30
+    MaxValue: 3650
+    Description: Days to retain per-credit state after a credit expires.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 180, 365]
+    Description: CloudWatch Logs retention.
+
+Conditions:
+
+  CreateTopic: !Equals [!Ref ExistingSnsTopicArn, '']
+  HasCustomKmsKey: !Not [!Equals [!Ref SnsKmsKeyArn, '']]
+  HasTargetAccounts: !Not [!Equals [!Ref TargetPayerAccounts, '']]
+
+  # CloudFormation cannot loop, so a comma-separated list is read by fixed index.
+  # Padding the split with empty strings keeps every !Select in range regardless
+  # of how many addresses were supplied.
+  HasEmail1: !Not [!Equals [!Select [0, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail2: !Not [!Equals [!Select [1, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail3: !Not [!Equals [!Select [2, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail4: !Not [!Equals [!Select [3, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail5: !Not [!Equals [!Select [4, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail6: !Not [!Equals [!Select [5, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail7: !Not [!Equals [!Select [6, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail8: !Not [!Equals [!Select [7, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail9: !Not [!Equals [!Select [8, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+  HasEmail10: !Not [!Equals [!Select [9, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']], '']]
+
+Resources:
+
+  # ---------------------------------------------------------- encryption key
+  # One customer-managed key encrypts the state table, the dead-letter queue,
+  # and (by default) the alert topic. Grants are split per service because each
+  # calls KMS differently: DynamoDB and the two queues/topics act on the
+  # function's behalf (kms:ViaService), while CloudWatch alarms call KMS with
+  # their own service principal and must NOT carry a ViaService condition, or
+  # the alarm silently fails to publish.
+
+  CreditsKey:
+    Type: AWS::KMS::Key
+    # A KMS key cannot be hard-deleted; it enters a pending-deletion window.
+    # Retain makes that explicit rather than pretending the stack removes it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub 'Encrypts credits-notifier state, DLQ and alerts for ${AWS::StackName}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Anti-lockout: the account keeps key administration. This is the
+          # account root, not a wildcard principal, so it does not trip the
+          # wildcard-principal rule.
+          - Sid: EnableRootAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # Principals in this account may use the key, but only when the call
+          # comes through DynamoDB, SNS or SQS (kms:ViaService). The notifier
+          # role's own IAM policy scopes WHICH principal; naming it here too
+          # would create a key -> role -> topic -> key dependency cycle, so the
+          # grant is account-scoped and the role policy does the narrowing.
+          # CreateGrant is included because DynamoDB requires it.
+          - Sid: AllowUseViaAwsServices
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+              - 'kms:CreateGrant'
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:ViaService':
+                  - 'dynamodb.*.amazonaws.com'
+                  - !Sub 'sns.${AWS::Region}.amazonaws.com'
+                  - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+          # SNS encrypting topic messages on its own behalf.
+          - Sid: AllowSnsService
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey*'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+          # CloudWatch alarms publishing to the encrypted topic. They call KMS
+          # with their own principal, so NO kms:ViaService here.
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey*'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  CreditsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-credits'
+      TargetKeyId: !Ref CreditsKey
+
+  # ------------------------------------------------------------------- state
+
+  CreditStateTable:
+    Type: AWS::DynamoDB::Table
+    # Derived state, rebuildable. If the table is recreated the handler
+    # re-baselines each account with one inventory email, not an alert storm.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub '${AWS::StackName}-credit-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        # Composite value "accountId#creditId" - see _state_key in the handler.
+        - {AttributeName: creditKey, AttributeType: S}
+      KeySchema:
+        - {AttributeName: creditKey, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: expireAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref CreditsKey
+      Tags:
+        - {Key: Application, Value: aws-credits-notifier}
+
+  # ------------------------------------------------------------ notification
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-credit-alerts'
+      DisplayName: AWS Credit Alerts
+      KmsMasterKeyId: !If [HasCustomKmsKey, !Ref SnsKmsKeyArn, !Ref CreditsKey]
+      Tags:
+        - {Key: Application, Value: aws-credits-notifier}
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateTopic
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: 'sns:Publish'
+            Resource: !Ref AlertTopic
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: DenyNonTlsRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref AlertTopic
+            Condition:
+              Bool: {'aws:SecureTransport': false}
+
+  EmailSubscription1:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail1
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [0, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription2:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail2
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [1, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription3:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail3
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [2, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription4:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail4
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [3, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription5:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail5
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [4, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription6:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail6
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [5, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription7:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail7
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [6, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription8:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail8
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [7, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription9:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail9
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [8, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  EmailSubscription10:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail10
+    Properties:
+      TopicArn: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+      Protocol: email
+      Endpoint: !Select [9, !Split [',', !Sub '${NotificationEmails},,,,,,,,,']]
+
+  # ----------------------------------------------------------------- compute
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    # Transient failure envelopes only.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref CreditsKey
+      KmsDataKeyReusePeriodSeconds: 300
+
+  NotifierRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-notifier-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: credits-notifier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # billing:GetCredits does not support resource-level permissions,
+              # so Resource must be "*". It is a read-only billing action.
+              - Sid: ReadCredits
+                Effect: Allow
+                Action: 'billing:GetCredits'
+                Resource: '*'
+              - Sid: WhoAmI
+                Effect: Allow
+                Action: 'sts:GetCallerIdentity'
+                Resource: '*'
+              - !If
+                - HasTargetAccounts
+                - Sid: AssumeSpokeRoles
+                  Effect: Allow
+                  Action: 'sts:AssumeRole'
+                  Resource: !Sub 'arn:${AWS::Partition}:iam::*:role/${AssumeRoleName}'
+                - !Ref 'AWS::NoValue'
+              - Sid: CreditStateAccess
+                Effect: Allow
+                Action:
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                Resource: !GetAtt CreditStateTable.Arn
+              - Sid: PublishAlerts
+                Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+              # DynamoDB uses the key on the function's behalf, and needs the
+              # full action set plus CreateGrant. The region is wildcarded
+              # because DynamoDB may call KMS region-independently.
+              - Sid: UseKeyForDynamoDb
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                  - 'kms:CreateGrant'
+                Resource: !GetAtt CreditsKey.Arn
+                Condition:
+                  StringLike:
+                    'kms:ViaService': 'dynamodb.*.amazonaws.com'
+              # Publishing to the encrypted topic and writing to the encrypted
+              # DLQ. Scoped by kms:ViaService so the grant only works through
+              # SNS and SQS. A customer override key for SNS is also allowed.
+              - Sid: UseKeyForSnsAndSqs
+                Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:Decrypt'
+                Resource: !If [HasCustomKmsKey, [!GetAtt CreditsKey.Arn, !Ref SnsKmsKeyArn], !GetAtt CreditsKey.Arn]
+                Condition:
+                  StringEquals:
+                    'kms:ViaService':
+                      - !Sub 'sns.${AWS::Region}.amazonaws.com'
+                      - !Sub 'sqs.${AWS::Region}.amazonaws.com'
+              - Sid: SendToDlq
+                Effect: Allow
+                Action: 'sqs:SendMessage'
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  # Created explicitly so RetentionInDays applies from the first invocation.
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    # Logs follow the stack lifecycle.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-notifier'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # The real handler is ~22 KB, far beyond the 4096-byte Code.ZipFile limit, so
+  # the function is created with a placeholder and InstallCode below replaces the
+  # code with the version carried in HandlerSourceGz. If you ever see the
+  # placeholder error at runtime, the custom resource did not complete.
+  NotifierFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [NotifierLogGroup, RolePropagation]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-notifier'
+      Description: Detects new and expiring AWS credits and publishes to SNS
+      Runtime: !Ref LambdaRuntime
+      Handler: credit_notifier.handler
+      Role: !GetAtt NotifierRole.Arn
+      Architectures: [arm64]
+      MemorySize: 256
+      Timeout: !Ref FunctionTimeout
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              raise RuntimeError(
+                  "Placeholder code still in place. The InstallCode custom "
+                  "resource should have replaced this with credit_notifier.py. "
+                  "Check the stack events and the code-installer log group."
+              )
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          STATE_TABLE: !Ref CreditStateTable
+          SNS_TOPIC_ARN: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+          EXPIRY_THRESHOLDS: !Ref ExpiryThresholdDays
+          MIN_REMAINING_ALERT: !Ref MinRemainingForExpiryAlert
+          STATE_TTL_DAYS: !Ref StateRetentionDays
+          # Billing is a global service homed in us-east-1. Kept separate
+          # from the stack's own region so this can deploy anywhere.
+          BILLING_REGION: us-east-1
+          TARGET_ACCOUNTS: !Ref TargetPayerAccounts
+          ASSUME_ROLE_NAME: !If [HasTargetAccounts, !Ref AssumeRoleName, '']
+          EXTERNAL_ID: !Ref ExternalId
+      Tags:
+        - {Key: Application, Value: aws-credits-notifier}
+
+  # ------------------------------------------------- IAM propagation barrier
+  # Both execution roles are created in this stack and consumed immediately by
+  # CreateFunction. IAM is eventually consistent, so a fresh role's trust policy
+  # may not yet be visible to the endpoint that validates sts:AssumeRole, and
+  # CreateFunction then fails with "the role cannot be assumed by Lambda". A
+  # large inline policy widens that window - which is why adding KMS statements
+  # tipped a previously reliable deploy into failing. This resource polls until
+  # each role is assumable, then signals CloudFormation, so the functions below
+  # start only once IAM has settled. DependsOn cannot do this - it orders
+  # creation but does not wait for propagation.
+  RolePropagationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-role-propagation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: probe-target-roles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Only NotifierRole needs probing - it carries the large KMS inline
+              # policy that widens the propagation window. CodeInstallerRole is
+              # tiny and settles within IAM's normal grace period. Probing it too
+              # would form a cycle, because CodeInstallerRole references
+              # NotifierFunction, which waits on this barrier.
+              - Sid: AssumeTargetRole
+                Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !GetAtt NotifierRole.Arn
+
+  RolePropagationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-role-propagation'
+      RetentionInDays: !Ref LogRetentionDays
+
+  RolePropagationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RolePropagationLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-role-propagation'
+      Description: Waits until freshly created execution roles are assumable
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt RolePropagationRole.Arn
+      MemorySize: 128
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          from botocore.exceptions import ClientError
+
+
+          def respond(event, context, status, message=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (message or "see CloudWatch logs")[:900],
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              urllib.request.urlopen(urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))}))
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] != "Delete":
+                      sts = boto3.client("sts")
+                      roles = event["ResourceProperties"].get("RoleArns", [])
+                      # Leave headroom before the 300s timeout so we always signal.
+                      deadline = time.time() + 240
+                      for arn in roles:
+                          while True:
+                              try:
+                                  sts.assume_role(RoleArn=arn, RoleSessionName="propcheck")
+                                  print("assumable:", arn)
+                                  break
+                              except ClientError as e:
+                                  code = e.response["Error"]["Code"]
+                                  # AccessDenied means the trust policy WAS evaluated,
+                                  # so it has propagated - good enough to proceed.
+                                  if code == "AccessDenied":
+                                      print("trust visible (AccessDenied):", arn)
+                                      break
+                                  if time.time() > deadline:
+                                      raise TimeoutError("role not assumable in time: " + arn)
+                                  time.sleep(3)
+                  respond(event, context, "SUCCESS")
+              except Exception as exc:
+                  print("ERROR", repr(exc))
+                  respond(event, context, "FAILED", str(exc))
+
+  RolePropagation:
+    Type: Custom::RolePropagation
+    Properties:
+      ServiceToken: !GetAtt RolePropagationFunction.Arn
+      # Bump to force a re-run if the polling logic above changes.
+      Version: 1
+      RoleArns:
+        - !GetAtt NotifierRole.Arn
+
+  # ------------------------------------------------------- code installation
+
+  CodeInstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-code-installer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: install-notifier-code
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Scoped to the one function this stack owns.
+              - Sid: ReplaceNotifierCode
+                Effect: Allow
+                Action:
+                  - 'lambda:UpdateFunctionCode'
+                  - 'lambda:GetFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource: !GetAtt NotifierFunction.Arn
+
+  CodeInstallerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-code-installer'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Small enough to sit inline. Decodes HandlerSourceGz, zips it, and replaces
+  # the notifier's placeholder code. Always answers CloudFormation, including on
+  # failure, so a mistake here surfaces as a stack error instead of a one-hour
+  # hang waiting for a response that never arrives.
+  CodeInstallerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [CodeInstallerLogGroup, RolePropagation]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-code-installer'
+      Description: Installs the credits-notifier handler carried in this template
+      Runtime: !Ref LambdaRuntime
+      Handler: index.handler
+      Role: !GetAtt CodeInstallerRole.Arn
+      MemorySize: 256
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import base64, gzip, io, json, urllib.request, zipfile, boto3
+
+
+          def respond(event, context, status, message=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": (message or "see CloudWatch logs")[:900],
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              urllib.request.urlopen(urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))}))
+
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] != "Delete":
+                      props = event["ResourceProperties"]
+                      name = props["FunctionName"]
+                      source = gzip.decompress(base64.b64decode("".join(props["SourceGz"].split())))
+                      buf = io.BytesIO()
+                      with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                          info = zipfile.ZipInfo(props.get("FileName", "credit_notifier.py"))
+                          info.external_attr = 0o644 << 16
+                          # A ZipInfo carries its own compress_type, defaulting to
+                          # ZIP_STORED, which silently overrides the ZipFile setting.
+                          info.compress_type = zipfile.ZIP_DEFLATED
+                          z.writestr(info, source)
+                      client = boto3.client("lambda")
+                      client.update_function_code(FunctionName=name, ZipFile=buf.getvalue())
+                      client.get_waiter("function_updated_v2").wait(FunctionName=name)
+                      print("installed %d bytes into %s" % (len(source), name))
+                  respond(event, context, "SUCCESS")
+              except Exception as exc:
+                  print("ERROR", repr(exc))
+                  respond(event, context, "FAILED", str(exc))
+
+  # Runtime is passed as a property on purpose: if the runtime changes,
+  # CloudFormation updates NotifierFunction (resetting it to the placeholder),
+  # and this property change forces the installer to run again afterwards.
+  #
+  # InstallerVersion exists because a custom resource only re-runs when one of
+  # ITS OWN properties changes. Editing CodeInstallerFunction's code does not
+  # change this resource's properties or its ServiceToken ARN, so without a
+  # version to bump, an installer fix would silently reach new deployments only.
+  # Bump it whenever the installer logic changes.
+  InstallCode:
+    Type: Custom::NotifierCode
+    Properties:
+      ServiceToken: !GetAtt CodeInstallerFunction.Arn
+      FunctionName: !Ref NotifierFunction
+      FileName: credit_notifier.py
+      Runtime: !Ref LambdaRuntime
+      InstallerVersion: 2
+      # gzip + base64 of src/credit_notifier.py. Regenerate with ./src/build.py
+      # after editing the handler; --check verifies this is current. Decode
+      # and audit it with the command in this folder's README - it decompresses
+      # byte-for-byte back to src/credit_notifier.py.
+      SourceGz: |
+        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
+
+  # -------------------------------------------------------------- scheduling
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: scheduler.amazonaws.com}
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: invoke-notifier
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: !GetAtt NotifierFunction.Arn
+
+  # DependsOn InstallCode so the schedule cannot fire the placeholder code.
+  DailySchedule:
+    Type: AWS::Scheduler::Schedule
+    DependsOn: InstallCode
+    Properties:
+      Name: !Sub '${AWS::StackName}-daily'
+      Description: Daily AWS credit check
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow: {Mode: 'OFF'}
+      Target:
+        Arn: !GetAtt NotifierFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+
+  # -------------------------------------------------------------- monitoring
+  # Without these a broken notifier looks exactly like "no credit changes" -
+  # the failure mode of any notification system is silence.
+
+  FunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-notifier-errors'
+      AlarmDescription: The credits notifier errored. Credit alerts may be missing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref NotifierFunction}
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]]
+
+  FunctionNotRunningAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-notifier-not-running'
+      AlarmDescription: >
+        The credits notifier has not run in 48 hours. The schedule may be
+        disabled or deleted - alerts would stop silently.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - {Name: FunctionName, Value: !Ref NotifierFunction}
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]]
+
+Outputs:
+
+  AlertTopicArn:
+    Description: SNS topic carrying credit alerts. Subscribe extra recipients here.
+    Value: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopicArn'
+
+  FunctionName:
+    Description: Lambda function name.
+    Value: !Ref NotifierFunction
+  NotifierRoleName:
+    Description: >
+      The notifier Lambda execution role name. When monitoring other payer
+      accounts, use this exact value as the HubRoleNamePattern parameter of
+      other-payers.yaml in each spoke account, so each spoke trusts only this
+      role.
+    Value: !Ref NotifierRole
+
+  StateTableName:
+    Description: >
+      DynamoDB table of per-credit state, keyed accountId#creditId. Delete an
+      item to make the notifier treat that credit as new again.
+    Value: !Ref CreditStateTable
+
+  DeadLetterQueueUrl:
+    Description: Failed invocations land here, retained 14 days.
+    Value: !Ref DeadLetterQueue
+
+  MonitoredAccounts:
+    Description: Accounts scanned. "this account only" when TargetPayerAccounts is blank.
+    Value: !If [HasTargetAccounts, !Ref TargetPayerAccounts, 'this account only']
+
+  ManualTestCommand:
+    Description: Run the notifier now instead of waiting for the schedule.
+    Value: !Sub 'aws lambda invoke --function-name ${NotifierFunction} --region ${AWS::Region} /dev/stdout'
+
+  AddRecipientCommand:
+    Description: Subscribe an additional email address after deployment.
+    Value: !Sub
+      - 'aws sns subscribe --topic-arn ${Topic} --protocol email --notification-endpoint NEW@example.com'
+      - Topic: !If [CreateTopic, !Ref AlertTopic, !Ref ExistingSnsTopicArn]

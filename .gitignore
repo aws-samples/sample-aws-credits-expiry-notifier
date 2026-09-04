@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+*.zip
+packaged-*.yaml
+.DS_Store
+# Office lock files, created while a .docx or .pptx is open
+~$*
